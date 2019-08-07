@@ -18,41 +18,53 @@ TraceRoute程序的基本原理是：
 通过区分收到的ICMP报文是超时报文（type=11）还是应答报文（type=0），以判断程序应该何时结束。
 """
 
+# ICMP报文类型 => 回送请求报文
+TYPE_ECHO_REQUEST = 8
+CODE_ECHO_REQUEST_DEFAULT = 0
 
-ICMP_ECHO_REQUEST_TYPE = 8                    # ICMP请求报文的type
-ICMP_ECHO_REQUEST_CODE = 0                    # ICMP请求报文的code（默认）
+# ICMP报文类型 => 回送应答报文
+TYPE_ECHO_REPLY = 0
+CODE_ECHO_REPLY_DEFAULT = 0
 
-ICMP_ECHO_REPLY_TYPE = 0                      # ICMP应答报文的type
-ICMP_OUTTIME_TYPE = 11                        # ICMP超时报文的type
-ICMP_UNREACHED_TYPE = 3                       # ICMP目的不可达报文的type
+# ICMP报文类型 => 数据报超时报文
+TYPE_ICMP_OVERTIME = 11
+CODE_TTL_OVERTIME = 0;
 
+# ICMP报文类型 => 目的站不可达报文
+TYPE_ICMP_UNREACHED = 3
+CODE_NET_UNREACHED = 0
+CODE_HOST_UNREACHED = 1
+CODE_PORT_UNREACHED = 3
 
-MAX_HOPS = 30                                 # 最大跳数，设置为30跳
-TIMEOUT = 3                                   # 路由超时，设置为3s
-TRIES = 1                                     # 尝试次数，设置为1次
-label = '*************{0}*************'       # 格式化输出
+MAX_HOPS = 30  # 设置路由转发最大跳数为30
+TIMEOUT = 3  # 如果一个请求超过3s未得到响应，则被认定为超时
+TRIES = 1  # 对于每个中间站点，探测的次数设置为1
+label = '*************{0}*************'
 
 
 def check_sum(data):
-    if len(data) % 2:                         # 长度为奇数，则补字节
+    """
+    计算校验和
+    """
+    if len(data) % 2:  # 长度为奇数，则补字节
         data += b'\x00'
     s = sum(array.array('H', data))
-    s = (s & 0xffff) + (s >> 16)              # 移位计算两次，以确保高16位为0
+    s = (s & 0xffff) + (s >> 16)  # 移位计算两次，以确保高16位为0
     s += (s >> 16)
-    s = ~s                                    # 取反
-    return socket.ntohs(s & 0xffff)           # 大小端处理
+    s = ~s  # 取反
+    return socket.ntohs(s & 0xffff)  # 大小端处理
 
 
-def get_host_info(ip_addr):
+def get_host_info(host_addr):
     """"
-    根据ip地址获取相应主机信息
+    获取相应ip地址对应的主机信息
     """
     try:
-        host_info = socket.gethostbyaddr(ip_addr)
+        host_info = socket.gethostbyaddr(host_addr)
     except socket.error as e:
-        display = '{0} (host name could not be determined)'.format(ip_addr)
+        display = '{0} (host name could not be determined)'.format(host_addr)
     else:
-        display = '{0} ({1})'.format(ip_addr, host_info[0])
+        display = '{0} ({1})'.format(host_addr, host_info[0])
     return display
 
 
@@ -65,29 +77,38 @@ def build_packet():
     |        id (16)     |  seq (16)       |
     ————————————————————————————————————————
     """
+    # 先将检验和设置为0
+    my_checksum = 0
+    # 用进程号作标识
+    my_id = os.getpid() & 0xffff
+    # 序列号
+    my_seq = 1
 
-    my_data = struct.pack("d", time.time())                          # 打包数据部分
+    # 打包出二进制首部
+    my_header = struct.pack("bbHHh", TYPE_ECHO_REQUEST, CODE_ECHO_REQUEST_DEFAULT, my_checksum, my_id, my_seq)
+    # 以当前系统时间作为报文的数据部分
+    my_data = struct.pack("d", time.time())
+    # 构建一个临时的数据报
+    package = my_header + my_data
 
-    my_check_sum = 0                                                 # 为了计算真正的检验和，暂时将检验和设置为0
-    my_id = os.getpid() & 0xffff                                     # 用进程号作标识
+    # 利用原始数据报来计算真正的校验和
+    my_checksum = check_sum(package)
 
-    my_header = struct.pack("bbHHh", ICMP_ECHO_REQUEST_TYPE, ICMP_ECHO_REQUEST_CODE, my_check_sum, my_id, 1)
-    my_check_sum = check_sum(my_header + my_data)
-
+    # 处理校验和的字节序列类型：主机序转换为网络序
     if sys.platform == 'darwin':
-        my_check_sum = socket.htons(my_check_sum) & 0xffff           # 将主机序转换为网络序
+        my_checksum = socket.htons(my_checksum) & 0xffff
     else:
-        my_check_sum = socket.htons(my_check_sum)
+        my_checksum = socket.htons(my_checksum)
 
-    # 根据计算出的校验和重新打包首部
-    my_header = struct.pack("bbHHh", ICMP_ECHO_REQUEST_TYPE, ICMP_ECHO_REQUEST_CODE, my_check_sum, my_id, 1)
-    packet = my_header + my_data
-    return packet
+    # 重新构建出真正的数据包
+    my_header = struct.pack("bbHHh", TYPE_ECHO_REQUEST, CODE_ECHO_REQUEST_DEFAULT, my_checksum, my_id, 1)
+    ip_package = my_header + my_data
+    return ip_package
 
 
 def main(hostname):
-
     print label.format(hostname)
+
     for ttl in xrange(1, MAX_HOPS):
         for tries in xrange(0, TRIES):
 
@@ -122,14 +143,14 @@ def main(hostname):
                 after_type, after_code, after_checksum, after_id, after_sequence = struct.unpack("bbHHh", icmp_header)
                 output = get_host_info(ip_info[0])
 
-                if after_type == ICMP_UNREACHED_TYPE:                                            # 目的不可达
+                if after_type == TYPE_ICMP_UNREACHED:  # 目的不可达
                     print "Wrong!unreached net/host/port!"
                     break
-                elif after_type == ICMP_OUTTIME_TYPE:                                            # 超时报文
-                    print " %d rtt=%.0f ms %s" % (ttl, during_time*1000, output)
+                elif after_type == TYPE_ICMP_OVERTIME:  # 超时报文
+                    print " %d rtt=%.0f ms %s" % (ttl, during_time * 1000, output)
                     continue
-                elif after_type == 0:                                                            # 应答报文
-                    print " %d rtt=%.0f ms %s" % (ttl, during_time*1000, output)
+                elif after_type == 0:  # 应答报文
+                    print " %d rtt=%.0f ms %s" % (ttl, during_time * 1000, output)
                     print "program run over!"
                     return
                 else:
